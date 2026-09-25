@@ -45,6 +45,13 @@
     超界（total_out_of_range）。全程仅整数区间运算，不枚举圈数组合。
     t_min == t_max 时两段圈数同时唯一；否则按等差数列端点给出各段用量
     上下界（每个可行 t 均严格满足 u1 + u2 = B）。
+
+漏采读数推断（solve_missing_reading）：
+    漏采时刻把账期切成左、右两段，容量分别为 floor(速率 × 各段秒数)。
+    账单总量 B 须满足 B = diff + K*M（diff = 末读数 - 首读数，K >= 0）；
+    同余且 B >= 0 时 K 自动非负。左侧用量 x 的可行闭区间为
+    [max(0, B - C_R), min(C_L, B)]，候选读数 (首读数 + x) mod M 在模 M
+    环上形成连续弧：跨零点拆段、覆盖全模数时返回全域。
 """
 
 from __future__ import annotations
@@ -65,6 +72,8 @@ REASON_TOTAL_INCOMPATIBLE_MODULUS = "total_incompatible_modulus"
 REASON_TOTAL_OUT_OF_RANGE = "total_out_of_range"
 # 跨日分配冲突原因：不存在可行的子段整数分配
 REASON_NO_FEASIBLE_ALLOCATION = "no_feasible_allocation"
+# 漏采读数推断冲突原因：漏采时刻两侧容量之和小于账单总量
+REASON_INSUFFICIENT_CAPACITY = "insufficient_capacity"
 
 
 @dataclass(frozen=True)
@@ -548,4 +557,125 @@ def reconcile_meter_total(
         ),
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 漏采读数推断（missing-reading）：账单总量 + 漏采时刻两侧容量约束候选读数
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MissingReadingResult:
+    """漏采读数推断结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_INCOMPATIBLE_MODULUS / REASON_INSUFFICIENT_CAPACITY
+    diff: int  # 末读数 - 首读数
+    total_wraps: Optional[int]  # 账单隐含的总回绕次数 K；不相容时为 None
+    left_capacity: int  # floor(速率 × 漏采时刻左侧秒数)
+    right_capacity: int  # floor(速率 × 漏采时刻右侧秒数)
+    # 左侧可行用量闭区间 [left_usage_min, left_usage_max]；冲突时为 None
+    left_usage_min: Optional[int]
+    left_usage_max: Optional[int]
+    # 候选读数闭区间（精确、不重叠，按左侧用量递增的环序）；冲突时为空
+    intervals: Tuple[Tuple[int, int], ...]
+    candidate_count: int  # 候选读数个数（去重后的剩余类数）；冲突时为 0
+
+    @property
+    def unique(self) -> bool:
+        """候选读数是否唯一。"""
+        return self.candidate_count == 1
+
+
+def solve_missing_reading(
+    start_value: int,
+    end_value: int,
+    left_seconds: int,
+    right_seconds: int,
+    modulus: int,
+    max_rate_per_second: Fraction,
+    total_usage: int,
+) -> MissingReadingResult:
+    """由账单总量与漏采时刻两侧容量推断漏采读数的候选闭区间。
+
+    漏采时刻把账期切成左（``left_seconds`` 秒）、右（``right_seconds``
+    秒）两段，整数容量分别为 ``C_L = floor(速率 × 左秒数)``、
+    ``C_R = floor(速率 × 右秒数)``。账单总量 ``B`` 须满足
+    ``B = diff + K*M``（``diff = 末读数 - 首读数``，``K >= 0`` 为总回绕
+    次数）：
+
+    1. ``B - diff`` 不被 ``M`` 整除即账单与模数不相容
+       （``total_incompatible_modulus``）；同余且 ``B >= 0`` 时
+       ``K = (B - diff) / M`` 自动满足非负性（``K >= K_min``），无需
+       另行校验；
+    2. 左侧用量 ``x`` 与右侧用量 ``B - x`` 须分别落在 ``[0, C_L]``、
+       ``[0, C_R]`` 内，故左侧可行用量闭区间为
+
+           [max(0, B - C_R), min(C_L, B)]
+
+       为空（即 ``B > C_L + C_R``）时两侧容量不足
+       （``insufficient_capacity``）。容量均为整数，区间内每个整数
+       ``x`` 都可由某个左右侧分配达到。
+
+    候选漏采读数为 ``(首读数 + x) mod M``。``x`` 取遍上述连续整数区间
+    时，候选在模 ``M`` 环上形成连续弧：弧上点数不少于 ``M`` 时覆盖全部
+    剩余类，返回全域 ``[0, M-1]``；否则自 ``(首读数 + x_min) mod M`` 起
+    展开，跨越零点时拆为 ``[a, M-1]`` 与 ``[0, b]`` 两段，保证各闭区间
+    精确、互不重叠且均落在 ``[0, M-1]`` 内。
+    """
+    diff = end_value - start_value
+    left_capacity = math.floor(max_rate_per_second * left_seconds)
+    right_capacity = math.floor(max_rate_per_second * right_seconds)
+
+    def _conflict(reason: str, total_wraps: Optional[int]) -> MissingReadingResult:
+        return MissingReadingResult(
+            status=STATUS_CONFLICT,
+            conflicts=(reason,),
+            diff=diff,
+            total_wraps=total_wraps,
+            left_capacity=left_capacity,
+            right_capacity=right_capacity,
+            left_usage_min=None,
+            left_usage_max=None,
+            intervals=(),
+            candidate_count=0,
+        )
+
+    # 账单总量与首尾读数差必须模 M 同余（等价于总回绕次数为整数）
+    if (total_usage - diff) % modulus != 0:
+        return _conflict(REASON_TOTAL_INCOMPATIBLE_MODULUS, None)
+
+    total_wraps = (total_usage - diff) // modulus
+    # 两侧容量之和容纳不下账单总量：无可行的左右侧整数分配
+    if total_usage > left_capacity + right_capacity:
+        return _conflict(REASON_INSUFFICIENT_CAPACITY, total_wraps)
+
+    x_lo = max(0, total_usage - right_capacity)
+    x_hi = min(left_capacity, total_usage)
+    count = x_hi - x_lo + 1
+    if count >= modulus:
+        # 候选点不少于模数：覆盖全部剩余类，返回全域
+        intervals = ((0, modulus - 1),)
+        count = modulus
+    else:
+        first = (start_value + x_lo) % modulus
+        arc = x_hi - x_lo  # 弧长（步数），候选数 = arc + 1 < modulus
+        if first + arc <= modulus - 1:
+            intervals = ((first, first + arc),)
+        else:
+            # 跨零点拆段：[first, M-1] 与 [0, 弧末端]
+            intervals = ((first, modulus - 1), (0, (first + arc) % modulus))
+
+    return MissingReadingResult(
+        status=STATUS_OK,
+        conflicts=(),
+        diff=diff,
+        total_wraps=total_wraps,
+        left_capacity=left_capacity,
+        right_capacity=right_capacity,
+        left_usage_min=x_lo,
+        left_usage_max=x_hi,
+        intervals=intervals,
+        candidate_count=count,
     )

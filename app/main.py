@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core import (
+    REASON_INSUFFICIENT_CAPACITY,
     REASON_NO_FEASIBLE_ALLOCATION,
     REASON_TOTAL_INCOMPATIBLE_MODULUS,
     REASON_TOTAL_OUT_OF_RANGE,
@@ -21,19 +22,22 @@ from app.core import (
     reconcile_meter_total,
     reconcile_total,
     solve_daily_segment,
+    solve_missing_reading,
     solve_segment,
 )
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
         "整条序列的回绕次数总和，仅确定圈数已唯一的分段用量；"
         "还支持按 UTC 自然日给出覆盖时段内每日最小/最大可行整数用量；"
         "并支持换表账单复核：跨旧表/新表两段（模数可不同）以账单总用量"
-        "精确联立两段回绕次数，不枚举圈数组合。"
+        "精确联立两段回绕次数，不枚举圈数组合；"
+        "以及漏采读数推断：以账单总用量与漏采时刻两侧容量约束候选读数，"
+        "给出精确不重叠的候选读数闭区间，不猜测读数。"
     ),
 )
 
@@ -41,6 +45,15 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # 请求模型
 # ---------------------------------------------------------------------------
+
+def _normalize_utc_second(v: datetime) -> datetime:
+    """秒精度带时区时间戳归一化为 UTC；Reading 与漏采时刻共用同一校验。"""
+    if v.tzinfo is None or v.utcoffset() is None:
+        raise ValueError("timestamp 必须携带时区信息（UTC 时间戳）")
+    if v.microsecond != 0:
+        raise ValueError("timestamp 必须为秒精度，不允许亚秒部分")
+    return v.astimezone(timezone.utc)
+
 
 class Reading(BaseModel):
     """一条秒精度 UTC 时间戳及其对应读数。"""
@@ -53,11 +66,7 @@ class Reading(BaseModel):
     @field_validator("timestamp")
     @classmethod
     def _normalize_timestamp(cls, v: datetime) -> datetime:
-        if v.tzinfo is None or v.utcoffset() is None:
-            raise ValueError("timestamp 必须携带时区信息（UTC 时间戳）")
-        if v.microsecond != 0:
-            raise ValueError("timestamp 必须为秒精度，不允许亚秒部分")
-        return v.astimezone(timezone.utc)
+        return _normalize_utc_second(v)
 
 
 class _BaseUsageRequest(BaseModel):
@@ -149,6 +158,49 @@ class MeterChangeRequest(BaseModel):
                 "旧表终读与新表初读必须为同一时刻（换表刻）：旧表终读 "
                 f"{self.old_meter.end.timestamp.isoformat()} 与新表初读 "
                 f"{self.new_meter.start.timestamp.isoformat()} 不一致"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# 漏采读数推断请求模型
+# ---------------------------------------------------------------------------
+
+
+class MissingReadingRequest(BaseModel):
+    """漏采读数推断请求：同一水表的起止读数、漏采时刻与账单总用量。"""
+
+    modulus: int = Field(ge=1, description="计数器模数（回绕周期）")
+    max_rate_per_second: Decimal = Field(
+        ge=0, description="每秒最大计数增量，支持小数（按精确分数计算）"
+    )
+    total_usage: int = Field(ge=0, description="该账期账单总用量（非负整数）")
+    start: Reading = Field(description="账期首读数")
+    end: Reading = Field(description="账期末读数")
+    missing_timestamp: datetime = Field(
+        description="漏采时刻，须为秒精度带时区时间戳，且严格介于起止时刻之间"
+    )
+
+    @field_validator("missing_timestamp")
+    @classmethod
+    def _normalize_missing_timestamp(cls, v: datetime) -> datetime:
+        return _normalize_utc_second(v)
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "MissingReadingRequest":
+        for r in (self.start, self.end):
+            if r.value >= self.modulus:
+                raise ValueError(
+                    f"读数 {r.value} 超出模数范围 [0, {self.modulus})"
+                )
+        if not (
+            self.start.timestamp < self.missing_timestamp < self.end.timestamp
+        ):
+            raise ValueError(
+                "漏采时刻必须严格介于起止时刻之间：首读数 "
+                f"{self.start.timestamp.isoformat()}、漏采时刻 "
+                f"{self.missing_timestamp.isoformat()}、末读数 "
+                f"{self.end.timestamp.isoformat()}"
             )
         return self
 
@@ -402,6 +454,68 @@ class MeterChangeResponse(BaseModel):
     conflicts: List[
         Union[MeterSegmentErrorOut, MeterTotalErrorOut]
     ] = Field(description="冲突明细：某段原本无解，或账单总量不相容/超界")
+
+
+# ---------------------------------------------------------------------------
+# 漏采读数推断接口响应模型
+# ---------------------------------------------------------------------------
+
+
+class CandidateIntervalOut(BaseModel):
+    """候选漏采读数的一个闭区间（端点含在内，均在 [0, modulus-1] 内）。"""
+
+    min_reading: int = Field(description="候选读数闭区间下界（含）")
+    max_reading: int = Field(description="候选读数闭区间上界（含）")
+
+
+class MissingReadingConflictOut(BaseModel):
+    reason: Literal["total_incompatible_modulus", "insufficient_capacity"]
+    detail: str
+    expected_remainder: Optional[int] = Field(
+        default=None,
+        description="账单与模数不相容时，账单应有的模 M 余数；容量不足时为 null",
+    )
+    left_capacity: int = Field(description="漏采时刻左侧容量 floor(速率×秒数)")
+    right_capacity: int = Field(description="漏采时刻右侧容量 floor(速率×秒数)")
+    feasible_max_total: int = Field(
+        description="两侧容量之和，即该账期可行账单总量的上界（含）"
+    )
+
+
+class MissingReadingResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    total_usage: int = Field(description="请求给出的账单总用量")
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；账单与模数不相容时为 null",
+    )
+    start_timestamp: datetime
+    end_timestamp: datetime
+    missing_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    left_seconds: int = Field(description="首读数到漏采时刻的秒数")
+    right_seconds: int = Field(description="漏采时刻到末读数的秒数")
+    left_capacity: int = Field(description="左侧容量 floor(速率×左秒数)")
+    right_capacity: int = Field(description="右侧容量 floor(速率×右秒数)")
+    left_usage_min: Optional[int] = Field(
+        default=None, description="左侧可行用量闭区间下界（含）；冲突时为 null"
+    )
+    left_usage_max: Optional[int] = Field(
+        default=None, description="左侧可行用量闭区间上界（含）；冲突时为 null"
+    )
+    candidate_intervals: List[CandidateIntervalOut] = Field(
+        description="候选漏采读数的精确、不重叠闭区间（按左侧用量递增的环序；"
+        "跨零点拆为两段，覆盖全模数时为全域 [0, modulus-1]）；冲突时为空"
+    )
+    candidate_count: int = Field(description="候选读数个数；冲突时为 0")
+    unique: bool = Field(
+        description="候选读数是否唯一（candidate_count == 1）"
+    )
+    conflicts: List[MissingReadingConflictOut] = Field(
+        description="冲突明细：账单总量与模数不相容，或两侧容量不足"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -868,4 +982,93 @@ def reconcile_meter_change_usage(req: MeterChangeRequest) -> MeterChangeResponse
         unique=both_unique,
         segments=segments,
         conflicts=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 漏采读数推断
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/usage/missing-reading", response_model=MissingReadingResponse)
+def infer_missing_reading(req: MissingReadingRequest) -> MissingReadingResponse:
+    """漏采读数推断：以账单总量与漏采时刻两侧容量约束候选读数，不猜测。
+
+    复用现有秒级时间戳、读数范围、模数与速率校验。先校验账单总量与首尾
+    读数差的模 M 同余（同余且账单非负时隐含总回绕次数自动非负），再按
+    漏采时刻两侧各自的 ``floor(速率×秒数)`` 整数容量求左侧可行用量闭
+    区间；容量不足即冲突。可行时将首读数加左侧用量取模，候选在模 M 环
+    上为连续弧：跨零点拆段、覆盖全模数时返回全域，并给出候选个数与
+    是否唯一。
+    """
+    left_seconds = int(
+        (req.missing_timestamp - req.start.timestamp).total_seconds()
+    )
+    right_seconds = int(
+        (req.end.timestamp - req.missing_timestamp).total_seconds()
+    )
+    result = solve_missing_reading(
+        req.start.value,
+        req.end.value,
+        left_seconds,
+        right_seconds,
+        req.modulus,
+        Fraction(req.max_rate_per_second),
+        req.total_usage,
+    )
+
+    conflicts: List[MissingReadingConflictOut] = []
+    for reason in result.conflicts:
+        if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+            expected = result.diff % req.modulus
+            detail = (
+                f"账单总量与首尾读数不相容：总量 B 必须满足 "
+                f"B ≡ {expected} (mod {req.modulus})"
+                f"（末读数 − 首读数 = {result.diff}），收到 "
+                f"{req.total_usage}（余数 {req.total_usage % req.modulus}），"
+                f"总回绕次数不是整数"
+            )
+        else:  # REASON_INSUFFICIENT_CAPACITY
+            expected = None
+            detail = (
+                f"两侧容量不足：账单总量 {req.total_usage} 超出漏采时刻两侧"
+                f"容量之和 {result.left_capacity} + {result.right_capacity} = "
+                f"{result.left_capacity + result.right_capacity}"
+                f"（左侧 {left_seconds}s、右侧 {right_seconds}s 各自的 "
+                f"floor(速率×秒数)），不存在可行的左右侧非负整数用量分配"
+            )
+        conflicts.append(
+            MissingReadingConflictOut(
+                reason=reason,  # type: ignore[arg-type]
+                detail=detail,
+                expected_remainder=expected,
+                left_capacity=result.left_capacity,
+                right_capacity=result.right_capacity,
+                feasible_max_total=result.left_capacity + result.right_capacity,
+            )
+        )
+
+    return MissingReadingResponse(
+        status=STATUS_CONFLICT if conflicts else STATUS_OK,
+        modulus=req.modulus,
+        total_usage=req.total_usage,
+        total_wraps=result.total_wraps,
+        start_timestamp=req.start.timestamp,
+        end_timestamp=req.end.timestamp,
+        missing_timestamp=req.missing_timestamp,
+        start_reading=req.start.value,
+        end_reading=req.end.value,
+        left_seconds=left_seconds,
+        right_seconds=right_seconds,
+        left_capacity=result.left_capacity,
+        right_capacity=result.right_capacity,
+        left_usage_min=result.left_usage_min,
+        left_usage_max=result.left_usage_max,
+        candidate_intervals=[
+            CandidateIntervalOut(min_reading=lo, max_reading=hi)
+            for lo, hi in result.intervals
+        ],
+        candidate_count=result.candidate_count,
+        unique=result.unique,
+        conflicts=conflicts,
     )

@@ -8,6 +8,8 @@
 
 并提供**换表账单复核**接口：接收旧表与新表各自的起止读数、模数与每秒最大速率（两表模数可不同），以及跨两表的账单总用量；要求旧表终读与新表初读为同一换表刻。两段先分别求满足非负增量与速率上限的回绕整数区间，再以扩展欧几里得对线性丢番图方程 `M旧·k旧 + M新·k新 = 账单 − 两段读数差` 求整数通解、用两段区间夹出参数范围（**不枚举圈数组合**），返回两段可行用量上下界及唯一性；单段无解、账单与模数不相容或联立超界时给出可区分的原因。
 
+另提供**漏采读数推断**接口：输入同一水表的起止读数与时间、两者之间的一个漏采时刻、模数、每秒速率上限与该账期账单总用量。先校验账单总量与首尾读数差的模数同余（同余且账单非负时，隐含总回绕次数自动非负），再按漏采时刻两侧各自的 `floor(速率 × 秒数)` 整数容量求**左侧可行用量闭区间**；将首读数加左侧用量后取模，在 `[0, 模数−1]` 内返回精确、不重叠的候选读数闭区间（跨零点拆段、覆盖全模数时返回全域）、候选个数与是否唯一。账单不相容或两侧容量不足时返回可区分的冲突原因，**不猜测读数**。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -21,6 +23,7 @@ docker compose up --build
 - 账单总量对账：`POST http://localhost:8000/v1/usage/reconcile`
 - 每日用量上下界：`POST http://localhost:8000/v1/usage/daily-range`
 - 换表账单复核：`POST http://localhost:8000/v1/usage/meter-change/reconcile`
+- 漏采读数推断：`POST http://localhost:8000/v1/usage/missing-reading`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
 
@@ -473,6 +476,127 @@ pytest
 
 请求校验错误（换表刻不同刻、段内时间不递增、缺时区、含亚秒、读数超出该表模数、负速率、账单为负等）返回 `422`。
 
+### `POST /v1/usage/missing-reading`
+
+漏采读数推断。输入同一水表的起止读数（各带秒精度带时区时间戳）、两者之间的一个**漏采时刻**、模数、每秒速率上限与该账期账单总用量。读数、时间戳、模数、速率的校验规则与其他接口完全一致（复用 `Reading` 校验）；`missing_timestamp` 使用同一时间戳校验，且必须**严格介于**起止时刻之间。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 10,
+  "total_usage": 300,
+  "start": { "timestamp": "2026-09-24T00:00:00Z", "value": 900 },
+  "end":   { "timestamp": "2026-09-24T00:01:40Z", "value": 200 },
+  "missing_timestamp": "2026-09-24T00:00:40Z"
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `modulus` | 整数 | `>= 1`，计数器模数（回绕周期） |
+| `max_rate_per_second` | 数值 | `>= 0`，每秒最大计数增量，支持小数（按精确分数计算） |
+| `total_usage` | 整数 | `>= 0`，该账期账单总用量 |
+| `start` / `end` | 对象 | 秒精度带时区读数，`0 <= value < modulus`，`end` 晚于 `start` |
+| `missing_timestamp` | 字符串 | 秒精度且带时区，严格介于 `start` 与 `end` 时刻之间 |
+
+**响应（可行，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 300,
+  "total_wraps": 1,
+  "start_timestamp": "2026-09-24T00:00:00Z",
+  "end_timestamp": "2026-09-24T00:01:40Z",
+  "missing_timestamp": "2026-09-24T00:00:40Z",
+  "start_reading": 900,
+  "end_reading": 200,
+  "left_seconds": 40,
+  "right_seconds": 60,
+  "left_capacity": 400,
+  "right_capacity": 600,
+  "left_usage_min": 0,
+  "left_usage_max": 300,
+  "candidate_intervals": [
+    { "min_reading": 900, "max_reading": 999 },
+    { "min_reading": 0, "max_reading": 200 }
+  ],
+  "candidate_count": 301,
+  "unique": false,
+  "conflicts": []
+}
+```
+
+上例中漏采时刻把账期切成左 40s、右 60s 两段，容量分别为 `floor(10×40)=400`、`floor(10×60)=600`；账单 300 与首尾读数差 `-700` 模 1000 同余（隐含总回绕次数 `K=1`）。左侧可行用量为 `[max(0, 300−600), min(400, 300)] = [0, 300]`，候选读数 `(900 + x) mod 1000` 在模数环上形成跨零点的连续弧，拆为 `[900, 999]` 与 `[0, 200]` 两个不重叠闭区间，共 301 个候选。
+
+- `left_usage_min` / `left_usage_max`：左侧（首读数 → 漏采时刻）可行用量闭区间，区间内每个整数都可达到。
+- `candidate_intervals`：候选漏采读数的精确、不重叠闭区间，端点含在内且均在 `[0, modulus-1]` 内，按左侧用量递增的环序给出；候选弧跨零点时拆为两段，候选数不少于模数时返回全域 `[0, modulus-1]`（单个区间）。
+- `candidate_count`：候选读数个数（去重后的剩余类数，不超过模数）；`unique` 当且仅当候选数为 1。
+- `total_wraps`：账单总量隐含的总回绕次数 `K = (total_usage − (end_reading − start_reading)) / modulus`。
+
+**候选唯一（`unique = true`）**：取速率为 `1`、起止读数 `100 → 200`（读数差 100）、账单 `100` 时，两侧容量为 40/60，左侧用量被夹到恰为 40，候选唯一：
+
+```json
+{
+  "status": "ok",
+  "total_wraps": 0,
+  "left_usage_min": 40,
+  "left_usage_max": 40,
+  "candidate_intervals": [ { "min_reading": 140, "max_reading": 140 } ],
+  "candidate_count": 1,
+  "unique": true
+}
+```
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+账单总量与首尾读数差模 `modulus` 不同余（`total_incompatible_modulus`）：
+
+```json
+{
+  "status": "conflict",
+  "total_wraps": null,
+  "candidate_intervals": [],
+  "candidate_count": 0,
+  "unique": false,
+  "conflicts": [
+    {
+      "reason": "total_incompatible_modulus",
+      "detail": "账单总量与首尾读数不相容：总量 B 必须满足 B ≡ 300 (mod 1000)（末读数 − 首读数 = -700），收到 301（余数 301），总回绕次数不是整数",
+      "expected_remainder": 300,
+      "left_capacity": 400,
+      "right_capacity": 600,
+      "feasible_max_total": 1000
+    }
+  ]
+}
+```
+
+账单同余但超出两侧容量之和（`insufficient_capacity`）：
+
+```json
+{
+  "status": "conflict",
+  "conflicts": [
+    {
+      "reason": "insufficient_capacity",
+      "detail": "两侧容量不足：账单总量 1100 超出漏采时刻两侧容量之和 40 + 60 = 100（左侧 40s、右侧 60s 各自的 floor(速率×秒数)），不存在可行的左右侧非负整数用量分配",
+      "expected_remainder": null,
+      "left_capacity": 40,
+      "right_capacity": 60,
+      "feasible_max_total": 100
+    }
+  ]
+}
+```
+
+- 两种冲突原因可区分：`total_incompatible_modulus` 为账单与模数不相容（`expected_remainder` 给出应有的余数，`total_wraps` 为 `null`）；`insufficient_capacity` 为两侧容量不足（`feasible_max_total` 给出可行账单上界，此时同余成立、`total_wraps` 已知）。
+- 冲突时 `candidate_intervals` 为空、`candidate_count` 为 0、`left_usage_min` / `left_usage_max` 为 `null`，**不猜测读数**。
+- 请求校验错误（漏采时刻不介于起止之间、缺时区、含亚秒、读数越界、负速率、账单为负或非整数等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -576,12 +700,34 @@ x_j 上界 = min(c_j,    (r2-r1) + k_max×M)
 
 同一天内多个独立读数区间的子段界直接求和，即得该日 `min_usage` / `max_usage`。各读数区间互不耦合，故某日的日界可由各区间独立选取分配而达到；但同一区间内不同子段（分属不同日）的极值一般互斥，所以**每日边界可分别达到，不保证各日上界（或下界）在同一分配下同时成立**，响应的 `boundary_note` 对此明确注明。
 
+### 漏采读数推断
+
+漏采时刻把账期 `[t_start, t_end]` 切成左 `s_L` 秒、右 `s_R` 秒两段，整数容量分别为
+
+```
+C_L = floor(max_rate_per_second × s_L)
+C_R = floor(max_rate_per_second × s_R)
+```
+
+账单总量 `B` 须满足 `B = (r_end − r_start) + K × modulus`（`K >= 0` 为总回绕次数）：
+
+1. `B − (r_end − r_start)` 不被 `modulus` 整除 → 账单与模数不相容（`total_incompatible_modulus`）；
+2. 同余且 `B >= 0` 时 `K` 自动非负（`0 <= B ≡ diff (mod M)` 蕴含 `K >= K_min`），无需另行校验；再要求 `B <= C_L + C_R`，否则两侧容量不足（`insufficient_capacity`）。
+
+左侧用量 `x` 与右侧用量 `B − x` 须分别落在 `[0, C_L]`、`[0, C_R]` 内，故左侧可行用量闭区间为
+
+```
+x ∈ [max(0, B − C_R), min(C_L, B)]
+```
+
+容量均为整数，区间内每个整数 `x` 都可由某个左右侧非负整数分配达到。候选漏采读数为 `(r_start + x) mod modulus`：`x` 连续取值时候选在模数环上形成连续弧，候选数为 `min(x_max − x_min + 1, modulus)`；弧不跨零点时为单个闭区间，跨零点时拆为 `[a, modulus−1]` 与 `[0, b]` 两段（精确、互不重叠），候选数不少于模数时覆盖全部剩余类、返回全域 `[0, modulus−1]`。候选数为 1 时 `unique = true`。全程仅整数运算（速率上限由 `Fraction` 精确取整），不枚举候选。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、换表丢番图联立与跨日子段界（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界与漏采读数候选区间（Fraction 精确计算）
 tests/
   test_api.py
 Dockerfile
