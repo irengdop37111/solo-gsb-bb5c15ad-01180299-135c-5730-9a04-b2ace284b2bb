@@ -8,7 +8,7 @@ from fractions import Fraction
 
 from fastapi.testclient import TestClient
 
-from app.core import reconcile_meter_total, solve_daily_segment
+from app.core import reconcile_meter_total, solve_daily_segment, solve_missing_reading
 from app.main import app
 
 client = TestClient(app)
@@ -28,6 +28,10 @@ def _daily_range(payload):
 
 def _meter_change(payload):
     return _post(payload, path="/v1/usage/meter-change/reconcile")
+
+
+def _missing_reading(payload):
+    return _post(payload, path="/v1/usage/missing-reading")
 
 
 # ---------------------------------------------------------------------------
@@ -1178,3 +1182,301 @@ def test_reconcile_meter_total_exact_by_brute_force():
                 assert r.conflicts == (expect,), (m1, m2, d1, d2, B)
                 assert r.old_segment is None and r.new_segment is None
     assert checked > 500
+
+
+# ---------------------------------------------------------------------------
+# 漏采读数复原 /v1/usage/missing-reading
+# ---------------------------------------------------------------------------
+
+def _missing_payload(
+    total_usage,
+    modulus=100,
+    rate=1,
+    start=("2026-09-24T00:00:00Z", 10),
+    missing="2026-09-24T00:00:10Z",
+    end=("2026-09-24T00:00:20Z", 30),
+):
+    return {
+        "modulus": modulus,
+        "max_rate_per_second": rate,
+        "total_usage": total_usage,
+        "start": {"timestamp": start[0], "value": start[1]},
+        "missing_timestamp": missing,
+        "end": {"timestamp": end[0], "value": end[1]},
+    }
+
+
+def test_missing_reading_unique_no_wrap():
+    """B=20：两侧容量各 10，u左 只能为 10，漏采读数唯一 20。"""
+    resp = _missing_reading(_missing_payload(20))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 0
+    assert (body["left_min_usage"], body["left_max_usage"]) == (10, 10)
+    assert body["candidate_count"] == 1
+    assert body["unique"] is True
+    assert body["full_domain"] is False
+    assert body["candidates"] == [{"lower": 20, "upper": 20}]
+    assert body["left_capacity"] == 10 and body["right_capacity"] == 10
+    assert body["left_elapsed_seconds"] == 10
+    assert body["right_elapsed_seconds"] == 10
+    assert body["conflicts"] == []
+
+
+def test_missing_reading_multiple_single_interval():
+    """B=10：u左 ∈ [0,10]，候选读数 [10,20] 共 11 个，不唯一。"""
+    resp = _missing_reading(
+        _missing_payload(10, end=("2026-09-24T00:00:20Z", 20))
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["unique"] is False
+    assert body["full_domain"] is False
+    assert body["candidate_count"] == 11
+    assert body["candidates"] == [{"lower": 10, "upper": 20}]
+    assert (body["left_min_usage"], body["left_max_usage"]) == (0, 10)
+
+
+def test_missing_reading_cross_zero_split():
+    """弧跨零点拆两段：r0=80 -> r1 ∈ [90,99]∪[0,10]，共 21 个候选。"""
+    resp = _missing_reading(
+        _missing_payload(
+            40, rate=3, start=("2026-09-24T00:00:00Z", 80),
+            end=("2026-09-24T00:00:20Z", 20),
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 1
+    assert body["candidate_count"] == 21
+    assert body["unique"] is False
+    assert body["full_domain"] is False
+    assert body["candidates"] == [
+        {"lower": 90, "upper": 99},
+        {"lower": 0, "upper": 10},
+    ]
+    assert (body["left_min_usage"], body["left_max_usage"]) == (10, 30)
+
+
+def test_missing_reading_unique_with_wrap():
+    """u左 被迫回绕一次：r0=80、u左=25 -> r1=5，候选唯一。"""
+    resp = _missing_reading(
+        _missing_payload(
+            50, rate=5, start=("2026-09-24T00:00:00Z", 80),
+            missing="2026-09-24T00:00:05Z",
+            end=("2026-09-24T00:00:10Z", 30),
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 1
+    assert body["candidate_count"] == 1
+    assert body["unique"] is True
+    assert body["candidates"] == [{"lower": 5, "upper": 5}]
+
+
+def test_missing_reading_full_domain():
+    """可行 u左 个数不少于模数：候选覆盖全域 [0,99]，candidate_count=100。"""
+    resp = _missing_reading(
+        _missing_payload(
+            1010, rate=1, start=("2026-09-24T00:00:00Z", 10),
+            missing="2026-09-24T00:16:40Z",
+            end=("2026-09-24T00:33:20Z", 20),
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 10
+    assert body["full_domain"] is True
+    assert body["unique"] is False
+    assert body["candidate_count"] == 100
+    assert body["candidates"] == [{"lower": 0, "upper": 99}]
+
+
+def test_missing_reading_modulus_one():
+    """M=1：唯一读数恒为 0，full_domain 为真。"""
+    resp = _missing_reading(
+        _missing_payload(
+            2, modulus=1, rate=1, start=("2026-09-24T00:00:00Z", 0),
+            missing="2026-09-24T00:00:05Z",
+            end=("2026-09-24T00:00:10Z", 0),
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["candidate_count"] == 1
+    assert body["unique"] is True
+    assert body["full_domain"] is True
+    assert body["candidates"] == [{"lower": 0, "upper": 0}]
+
+
+def test_missing_reading_incompatible_modulus():
+    """B 与首尾读数差模 M 不同余：total_incompatible_modulus，不猜测。"""
+    resp = _missing_reading(_missing_payload(5))  # diff=20，B 须 ≡20 mod 100
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["candidates"] == []
+    assert body["candidate_count"] == 0
+    conflict = body["conflicts"][0]
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert conflict["expected_remainder"] == 20
+    assert conflict["total_wraps"] is None
+    # 上下文容量仍返回
+    assert conflict["left_capacity"] == 10
+    assert conflict["right_capacity"] == 10
+
+
+def test_missing_reading_insufficient_capacity():
+    """账单同余但超过两侧整数容量之和：no_feasible_allocation。"""
+    resp = _missing_reading(_missing_payload(20, rate=0.4))  # C1=C2=floor(4)=4
+    body = resp.json()
+    assert body["status"] == "conflict"
+    conflict = body["conflicts"][0]
+    assert conflict["reason"] == "no_feasible_allocation"
+    assert conflict["expected_remainder"] is None
+    assert conflict["total_wraps"] == 0
+    assert conflict["left_capacity"] == 4
+    assert conflict["right_capacity"] == 4
+    assert conflict["feasible_min_total"] == 0
+    assert conflict["feasible_max_total"] == 8
+
+
+def test_missing_reading_fractional_rate_unique():
+    """0.5/s × 3s 容量 floor 为 1：u左 恰为 1，r1 唯一为 99。"""
+    resp = _missing_reading(
+        _missing_payload(
+            2, rate=0.5, start=("2026-09-24T00:00:00Z", 98),
+            missing="2026-09-24T00:00:03Z",
+            end=("2026-09-24T00:00:06Z", 0),
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["left_capacity"] == 1 and body["right_capacity"] == 1
+    assert body["candidate_count"] == 1
+    assert body["unique"] is True
+    assert body["candidates"] == [{"lower": 99, "upper": 99}]
+    assert (body["left_min_usage"], body["left_max_usage"]) == (1, 1)
+
+
+def test_missing_reading_timezone_offset_normalized():
+    """漏采刻与端点以不同时区表达，换算 UTC 后判定不变。"""
+    payload = _missing_payload(20)
+    payload["missing_timestamp"] = "2026-09-24T08:00:10+08:00"
+    resp = _missing_reading(payload)
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["missing_timestamp"] == "2026-09-24T00:00:10Z"
+    assert body["left_elapsed_seconds"] == 10
+    assert body["right_elapsed_seconds"] == 10
+
+
+def test_missing_reading_reuses_validation():
+    """复用时间/数值校验：非法输入一律 422。"""
+    base = _missing_payload(20)
+
+    def expect_422(mut):
+        import copy
+
+        payload = copy.deepcopy(base)
+        mut(payload)
+        assert _missing_reading(payload).status_code == 422
+
+    # 漏采刻不严格居中（等于起始时刻）
+    expect_422(lambda p: p.update(missing_timestamp="2026-09-24T00:00:00Z"))
+    # 漏采刻在末读数之后
+    expect_422(lambda p: p.update(missing_timestamp="2026-09-24T00:00:21Z"))
+    # 漏采刻缺时区
+    expect_422(lambda p: p.update(missing_timestamp="2026-09-24T00:00:10"))
+    # 漏采刻含亚秒
+    expect_422(lambda p: p.update(missing_timestamp="2026-09-24T00:00:10.5Z"))
+    # 首读数越界
+    expect_422(lambda p: p["start"].update(value=100))
+    # 末读数越界
+    expect_422(lambda p: p["end"].update(value=-1))
+    # 模数 < 1
+    expect_422(lambda p: p.update(modulus=0))
+    # 负速率
+    expect_422(lambda p: p.update(max_rate_per_second=-1))
+    # 账单总量为负
+    expect_422(lambda p: p.update(total_usage=-1))
+    # 账单总量非整数
+    expect_422(lambda p: p.update(total_usage=1.5))
+    # 端点时间戳复用读数校验（缺时区）
+    expect_422(
+        lambda p: p["start"].update(timestamp="2026-09-24T00:00:00")
+    )
+
+
+# ---------------------------------------------------------------------------
+# solve_missing_reading 精确性：与全枚举暴力结果比对（固定随机种子）
+# ---------------------------------------------------------------------------
+
+def test_solve_missing_reading_exact_by_brute_force():
+    """随机小参数下，候选区间与逐一枚举 (u左, u右) 的结果一致。"""
+    rng = random.Random(20260925)
+    checked_feasible = 0
+    checked_conflict = 0
+    for _ in range(8000):
+        modulus = rng.choice([1, 2, 3, 5, 7, 10])
+        rate = Fraction(rng.randint(0, 6), rng.randint(1, 3))
+        s1 = rng.randint(1, 12)
+        s2 = rng.randint(1, 12)
+        r0, r2 = rng.randrange(modulus), rng.randrange(modulus)
+        c1 = math.floor(rate * s1)
+        c2 = math.floor(rate * s2)
+        B = rng.randint(-1 if rng.random() < 0.05 else 0, c1 + c2 + rng.randint(0, 5))
+
+        if B < 0:
+            continue  # 负值由请求层 422 拦截，核心函数不处理
+
+        expected_u = [
+            u1 for u1 in range(0, c1 + 1)
+            if 0 <= B - u1 <= c2
+        ]
+        expected_residues = {(r0 + u) % modulus for u in expected_u}
+
+        result = solve_missing_reading(
+            r0, r2, s1, s2, modulus, rate, B
+        )
+
+        compatible = (B - (r2 - r0)) % modulus == 0
+        if not compatible:
+            # 与模数不同余优先冲突，即使容量恰好能凑出 B 也不产生候选
+            checked_conflict += 1
+            assert result.status == "conflict", (modulus, rate, s1, s2, r0, r2, B)
+            assert result.conflicts == ("total_incompatible_modulus",)
+            assert result.candidates == ()
+            continue
+        if not expected_u:
+            checked_conflict += 1
+            assert result.status == "conflict", (modulus, rate, s1, s2, r0, r2, B)
+            assert result.conflicts == ("no_feasible_allocation",)
+            assert result.candidates == ()
+            continue
+
+        checked_feasible += 1
+        assert result.status == "ok"
+        assert result.total_wraps == (B - (r2 - r0)) // modulus
+        assert result.left_min_usage == min(expected_u)
+        assert result.left_max_usage == max(expected_u)
+        # 暴力验证可行 u左 必为连续整数区间
+        assert expected_u == list(range(min(expected_u), max(expected_u) + 1))
+
+        # 由返回区间重建残差集合（模拟跨零拆段）
+        reconstructed = set()
+        for lo, hi in result.candidates:
+            assert 0 <= lo <= hi < modulus
+            reconstructed.update(range(lo, hi + 1))
+        # 区间互不重叠
+        assert sum(hi - lo + 1 for lo, hi in result.candidates) == len(reconstructed)
+        assert reconstructed == expected_residues
+        assert result.candidate_count == len(expected_residues)
+        assert result.unique == (len(expected_residues) == 1)
+        assert result.full_domain == (len(expected_residues) == modulus)
+        if result.full_domain:
+            assert result.candidates == ((0, modulus - 1),)
+
+    assert checked_feasible > 800
+    assert checked_conflict > 200

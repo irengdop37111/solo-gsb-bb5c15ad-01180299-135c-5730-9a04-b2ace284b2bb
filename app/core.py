@@ -45,6 +45,21 @@
     超界（total_out_of_range）。全程仅整数区间运算，不枚举圈数组合。
     t_min == t_max 时两段圈数同时唯一；否则按等差数列端点给出各段用量
     上下界（每个可行 t 均严格满足 u1 + u2 = B）。
+
+漏采读数候选（solve_missing_reading）：
+    已知同一水表首读 r0（时刻 t0）、末读 r2（时刻 t2）与严格居中的漏采
+    时刻 t1，两侧整数容量分别为
+        C1 = floor(rate × (t1 - t0))，C2 = floor(rate × (t2 - t1))
+    账单总量 B 要求两侧真实用量满足 u1 + u2 = B，且
+        0 <= u1 <= C1，0 <= u2 = B - u1 <= C2
+    故左侧可行用量恰为整数闭区间
+        u1 ∈ [max(0, B - C2), min(C1, B)]
+    区间为空即两侧容量不足（no_feasible_allocation）。
+    账单首先须满足 B ≡ r2 - r0 (mod M)（total_incompatible_modulus）；
+    相容时每个可行 u1 对应唯一候选漏采读数
+        r1 = (r0 + u1) mod M
+    连续的 u1 在计数环上映射为一段连续弧：弧跨 0 时拆成两个互不重叠的
+        闭区间；候选数 >= M 时覆盖全模数，直接返回全域 [0, M-1]。
 """
 
 from __future__ import annotations
@@ -549,3 +564,122 @@ def reconcile_meter_total(
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
     )
+
+
+# ---------------------------------------------------------------------------
+# 漏采读数候选（missing-reading）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MissingReadingResult:
+    """漏采读数候选结果（可行或冲突）。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    # 账单总量与首尾读数差隐含的总回绕次数 K = (B - (r2-r0)) / M；不相容时为 None
+    total_wraps: Optional[int]
+    left_capacity: int  # C1 = floor(rate × 漏采前秒数)
+    right_capacity: int  # C2 = floor(rate × 漏采后秒数)
+    left_seconds: int
+    right_seconds: int
+    # 左侧可行用量闭区间端点；冲突时为 None
+    left_min_usage: Optional[int]
+    left_max_usage: Optional[int]
+    candidate_count: int  # 候选读数个数（= 可行左侧用量个数；全域时为 modulus）
+    unique: bool  # 候选读数是否唯一
+    full_domain: bool  # 候选是否覆盖全模数 [0, M-1]
+    candidates: Tuple[Tuple[int, int], ...]  # 0..M-1 内互不重叠的候选读数闭区间
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_INCOMPATIBLE_MODULUS
+    # 或 REASON_NO_FEASIBLE_ALLOCATION
+
+
+def solve_missing_reading(
+    start_value: int,
+    end_value: int,
+    left_seconds: int,
+    right_seconds: int,
+    modulus: int,
+    max_rate_per_second: Fraction,
+    total_usage: int,
+) -> MissingReadingResult:
+    """由首尾读数、漏采时刻与账单总量求漏采读数的精确候选区间。
+
+    :param start_value: 首读数 r0（``0 <= r0 < modulus``，由请求层校验）
+    :param end_value: 末读数 r2（同上）
+    :param left_seconds: 首读数到漏采刻的秒数（严格为正）
+    :param right_seconds: 漏采刻到末读数的秒数（严格为正）
+    :param modulus: 计数器模数 M
+    :param max_rate_per_second: 每秒最大计数增量（精确分数）
+    :param total_usage: 这段账单总用量 B（非负整数，由请求层校验）
+    """
+    c1 = math.floor(max_rate_per_second * left_seconds)
+    c2 = math.floor(max_rate_per_second * right_seconds)
+
+    diff = end_value - start_value
+
+    def _conflict(
+        reasons: Tuple[str, ...], total_wraps: Optional[int]
+    ) -> MissingReadingResult:
+        return MissingReadingResult(
+            status=STATUS_CONFLICT,
+            total_wraps=total_wraps,
+            left_capacity=c1,
+            right_capacity=c2,
+            left_seconds=left_seconds,
+            right_seconds=right_seconds,
+            left_min_usage=None,
+            left_max_usage=None,
+            candidate_count=0,
+            unique=False,
+            full_domain=False,
+            candidates=(),
+            conflicts=reasons,
+        )
+
+    # 1) 账单总量须与首尾读数差模 M 同余（总回绕次数 K 为整数）
+    numerator = total_usage - diff
+    if numerator % modulus != 0:
+        return _conflict((REASON_TOTAL_INCOMPATIBLE_MODULUS,), None)
+    total_wraps = numerator // modulus
+
+    # 2) 左侧可行用量闭区间：u1 ∈ [max(0, B-C2), min(C1, B)]
+    u_min = max(0, total_usage - c2)
+    u_max = min(c1, total_usage)
+    if u_min > u_max:
+        return _conflict((REASON_NO_FEASIBLE_ALLOCATION,), total_wraps)
+
+    count = u_max - u_min + 1  # 可行 u1 个数
+    # 候选读数是模 M 的残差：连续 u1 个数 >= M 时所有残差都可取到
+    candidate_count = min(count, modulus)
+
+    # 3) r1 = (r0 + u1) mod M 对连续 u1 形成计数环上一段连续弧
+    if count >= modulus:
+        # 覆盖全模数（残差 0..M-1 全部可取，不按 u1 重复计数）
+        candidates = ((0, modulus - 1),)
+        full_domain = True
+    else:
+        first = (start_value + u_min) % modulus
+        last = (start_value + u_max) % modulus
+        if first <= last:
+            candidates = ((first, last),)
+        else:
+            # 弧跨零点：拆成 [first, M-1] 与 [0, last]，互不重叠
+            candidates = ((first, modulus - 1), (0, last))
+        full_domain = False
+
+    return MissingReadingResult(
+        status=STATUS_OK,
+        total_wraps=total_wraps,
+        left_capacity=c1,
+        right_capacity=c2,
+        left_seconds=left_seconds,
+        right_seconds=right_seconds,
+        left_min_usage=u_min,
+        left_max_usage=u_max,
+        candidate_count=candidate_count,
+        unique=candidate_count == 1,
+        full_domain=full_domain,
+        candidates=tuple(candidates),
+        conflicts=(),
+    )
+

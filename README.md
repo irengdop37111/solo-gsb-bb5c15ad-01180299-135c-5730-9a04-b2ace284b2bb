@@ -8,6 +8,8 @@
 
 并提供**换表账单复核**接口：接收旧表与新表各自的起止读数、模数与每秒最大速率（两表模数可不同），以及跨两表的账单总用量；要求旧表终读与新表初读为同一换表刻。两段先分别求满足非负增量与速率上限的回绕整数区间，再以扩展欧几里得对线性丢番图方程 `M旧·k旧 + M新·k新 = 账单 − 两段读数差` 求整数通解、用两段区间夹出参数范围（**不枚举圈数组合**），返回两段可行用量上下界及唯一性；单段无解、账单与模数不相容或联立超界时给出可区分的原因。
 
+另提供**漏采读数复原**接口：已知同一水表的首尾读数与时间、两者之间的漏采时刻、模数、每秒速率上限与这段账单总用量；先校验账单总量与首尾读数差模 `模数` 同余且两侧整数容量可拆分，再按漏采时刻两侧各自的 `floor(速率 × 秒数)` 容量夹出左侧可行用量闭区间，将 `(首读数 + 左侧用量) mod 模数` 映射为 `0..模数-1` 范围内**精确、不重叠的候选读数闭区间**（跨零点拆段、覆盖全模数时返回全域），并给出候选个数与是否唯一；账单不相容或容量不足时返回可区分的冲突原因，**不猜测读数**。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -21,8 +23,18 @@ docker compose up --build
 - 账单总量对账：`POST http://localhost:8000/v1/usage/reconcile`
 - 每日用量上下界：`POST http://localhost:8000/v1/usage/daily-range`
 - 换表账单复核：`POST http://localhost:8000/v1/usage/meter-change/reconcile`
+- 漏采读数复原：`POST http://localhost:8000/v1/usage/missing-reading`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
+
+所有接口均监听本机 `http://localhost:8000`，用浏览器打开 `http://localhost:8000/docs` 可直接在线试调；也可以用 `curl` 从本机访问，例如：
+
+```bash
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/v1/usage/missing-reading \
+  -H 'Content-Type: application/json' \
+  -d '{"modulus":1000,"max_rate_per_second":10,"total_usage":200,"start":{"timestamp":"2026-09-24T00:00:00Z","value":100},"missing_timestamp":"2026-09-24T00:00:10Z","end":{"timestamp":"2026-09-24T00:00:20Z","value":300}}'
+```
 
 ### 配置
 
@@ -473,6 +485,173 @@ pytest
 
 请求校验错误（换表刻不同刻、段内时间不递增、缺时区、含亚秒、读数超出该表模数、负速率、账单为负等）返回 `422`。
 
+### `POST /v1/usage/missing-reading`
+
+漏采读数复原。输入**同一水表**的首读数、末读数（各带秒精度带时区时间戳）、严格位于两者之间的漏采时刻、模数、每秒最大速率与这段账单总用量。时间戳与读数范围、速率、模数、账单非负整数等校验与其他接口完全一致（复用 `Reading` 校验），并额外要求 `start.timestamp < missing_timestamp < end.timestamp`。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 10,
+  "total_usage": 200,
+  "start": { "timestamp": "2026-09-24T00:00:00Z", "value": 100 },
+  "missing_timestamp": "2026-09-24T00:00:10Z",
+  "end": { "timestamp": "2026-09-24T00:00:20Z", "value": 300 }
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `modulus` | 整数 | `>= 1`，计数器模数 |
+| `max_rate_per_second` | 数值 | `>= 0`，支持小数，按精确分数计算 |
+| `total_usage` | 整数 | `>= 0`，这段账单总用量 |
+| `start` / `end` | 对象 | 秒精度带时区读数，`0 <= value < modulus` |
+| `missing_timestamp` | 字符串 | 漏采时刻，秒精度、带时区，严格满足 `start < missing < end`（允许不同时区表达） |
+
+**响应（候选唯一，`200`，`status = "ok"`，`unique = true`）**
+
+上例两侧各 10 秒、容量各 100；账单 200 与首尾读数差 `300-100=200` 同余，左侧用量必须恰为 100（右侧亦 100），漏采读数唯一为 `(100+100) mod 1000 = 200`：
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 200,
+  "total_wraps": 0,
+  "start_timestamp": "2026-09-24T00:00:00Z",
+  "missing_timestamp": "2026-09-24T00:00:10Z",
+  "end_timestamp": "2026-09-24T00:00:20Z",
+  "start_reading": 100,
+  "end_reading": 300,
+  "left_elapsed_seconds": 10,
+  "right_elapsed_seconds": 10,
+  "left_capacity": 100,
+  "right_capacity": 100,
+  "left_min_usage": 100,
+  "left_max_usage": 100,
+  "candidate_count": 1,
+  "unique": true,
+  "full_domain": false,
+  "candidates": [{ "lower": 200, "upper": 200 }],
+  "conflicts": []
+}
+```
+
+**响应（多个候选，单段闭区间）**：账单取 `100`（末读 `200`）时，左侧用量可取 `0..100` 中任意整数，候选读数为连续区间 `[100,200]` 共 101 个：
+
+```json
+{
+  "status": "ok",
+  "total_usage": 100,
+  "total_wraps": 0,
+  "left_capacity": 100,
+  "right_capacity": 100,
+  "left_min_usage": 0,
+  "left_max_usage": 100,
+  "candidate_count": 101,
+  "unique": false,
+  "full_domain": false,
+  "candidates": [{ "lower": 100, "upper": 200 }],
+  "conflicts": []
+}
+```
+
+**响应（候选弧跨零点，拆成两段）**：首读 `900`、末读 `100`、速率 `20/s`、两侧各 10 秒（容量各 200）、账单 `200`（与读数差 `-800` 模 1000 同余，`K=1`），左侧用量 `0..200` 映射为 `[900,999] ∪ [0,100]`，两段**互不重叠**：
+
+```json
+{
+  "status": "ok",
+  "total_usage": 200,
+  "total_wraps": 1,
+  "left_capacity": 200,
+  "right_capacity": 200,
+  "left_min_usage": 0,
+  "left_max_usage": 200,
+  "candidate_count": 201,
+  "unique": false,
+  "full_domain": false,
+  "candidates": [
+    { "lower": 900, "upper": 999 },
+    { "lower": 0, "upper": 100 }
+  ],
+  "conflicts": []
+}
+```
+
+**响应（覆盖全模数）**：首尾间隔各 1000 秒、速率 `10/s`（两侧容量各 10000），首读 `100`、末读 `200`、账单 `10100` 时左侧用量可取 9901 个连续整数，模 1000 的残差覆盖全部读数，直接返回全域，`candidate_count` 按去重后的残差计为 `1000`：
+
+```json
+{
+  "status": "ok",
+  "total_usage": 10100,
+  "total_wraps": 10,
+  "left_capacity": 10000,
+  "right_capacity": 10000,
+  "left_min_usage": 100,
+  "left_max_usage": 10000,
+  "candidate_count": 1000,
+  "unique": false,
+  "full_domain": true,
+  "candidates": [{ "lower": 0, "upper": 999 }],
+  "conflicts": []
+}
+```
+
+- `left_min_usage` / `left_max_usage`：漏采刻左侧（首读数 → 漏采刻）的可行用量闭区间；每个可行左侧用量 `u左` 对应右侧用量 `total_usage - u左`，均为非负整数且不超过各自容量。
+- `candidates`：候选漏采读数闭区间列表，端点均在 `[0, modulus-1]` 内；各区间互不重叠，合计恰含 `candidate_count` 个整数读数。弧跨零点时拆为两段；覆盖全模数时恒为单段 `[0, modulus-1]`。
+- `candidate_count`：**不同候选读数的个数**（模 `modulus` 去重），等于 `1` 时 `unique = true`。
+- `full_domain`：候选是否覆盖全模数（此时每个 `0..modulus-1` 的读数都可能，信息无收敛）。
+- `total_wraps`：账单与首尾读数差隐含的首尾之间总回绕次数 `K = (total_usage - (r_end - r_start)) / modulus`。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+- `reason = "total_incompatible_modulus"`：账单总量与首尾读数差模 `modulus` 不同余，两侧回绕次数之和不是整数；`expected_remainder` 给出应有余数 `(r_end - r_start) mod modulus`，`total_wraps` 为 `null`，`candidates` 为空。
+
+```json
+{
+  "status": "conflict",
+  "total_usage": 50,
+  "total_wraps": null,
+  "candidate_count": 0,
+  "unique": false,
+  "full_domain": false,
+  "candidates": [],
+  "left_capacity": 100,
+  "right_capacity": 100,
+  "conflicts": [
+    {
+      "reason": "total_incompatible_modulus",
+      "detail": "账单总量与模数不相容：总量 B 必须满足 B ≡ 100 (mod 1000)（末读数 200 − 首读数 100 = 100），收到 50（余数 50），漏采刻两侧回绕次数之和无法为整数，不猜测读数",
+      "expected_remainder": 100,
+      "total_wraps": null,
+      "feasible_min_total": null,
+      "feasible_max_total": null,
+      "left_capacity": 100,
+      "right_capacity": 100
+    }
+  ]
+}
+```
+
+- `reason = "no_feasible_allocation"`：账单同余（`total_wraps` 照常给出），但无法拆成两侧各自不超过整数容量的非负用量，即 `B > C左 + C右`；响应给出两侧容量与可行账单上界 `feasible_max_total = C左 + C右`。下例速率 `0.4/s`、各 10 秒，两侧容量分别 `floor(4)=4`，账单 100 无法容纳：
+
+```json
+{
+  "reason": "no_feasible_allocation",
+  "detail": "漏采时刻两侧整数容量不足：左侧容量 floor(速率×10s) = 4，右侧容量 floor(速率×10s) = 4；账单总量须能拆成 0 <= u左 <= 4、0 <= u右 <= 4 的非负整数用量（u左 + u右 = B），故 B 不得超过 8；收到 100，不存在可行拆分，不猜测读数",
+  "expected_remainder": null,
+  "total_wraps": 0,
+  "feasible_min_total": 0,
+  "feasible_max_total": 8,
+  "left_capacity": 4,
+  "right_capacity": 4
+}
+```
+
+请求校验错误（漏采时刻不严格居中、缺时区、含亚秒、读数越界、模数非法、负速率、账单为负或非整数等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -576,12 +755,46 @@ x_j 上界 = min(c_j,    (r2-r1) + k_max×M)
 
 同一天内多个独立读数区间的子段界直接求和，即得该日 `min_usage` / `max_usage`。各读数区间互不耦合，故某日的日界可由各区间独立选取分配而达到；但同一区间内不同子段（分属不同日）的极值一般互斥，所以**每日边界可分别达到，不保证各日上界（或下界）在同一分配下同时成立**，响应的 `boundary_note` 对此明确注明。
 
+### 漏采读数复原
+
+设首读数为 `r0`（时刻 `t0`）、末读数为 `r2`（时刻 `t2`），漏采时刻 `t1` 严格居中（`t0 < t1 < t2`），漏采读数 `r1` 与两侧真实用量 `u左、u右` 满足
+
+```
+r1 ≡ r0 + u左 (mod M)，r2 ≡ r1 + u右 (mod M)
+u左 + u右 = B （账单总用量）
+```
+
+两侧整数容量分别按各自时长独立取整（与跨日子段一致）：
+
+```
+C左 = floor(max_rate_per_second × (t1 - t0))
+C右 = floor(max_rate_per_second × (t2 - t1))
+```
+
+校验与求解顺序：
+
+1. **账单同余**：由首尾望远镜关系 `B ≡ r2 - r0 (mod M)` 必须成立，否则返回 `total_incompatible_modulus`（给出 `expected_remainder = (r2-r0) mod M`），不产生候选；
+2. **容量可拆分**：`u左` 与 `u右 = B - u左` 须为非负整数且分别不超过两侧容量，故左侧可行用量恰为连续整数闭区间
+
+   ```
+   u左 ∈ [max(0, B - C右), min(C左, B)]
+   ```
+
+   下界大于上界时返回 `no_feasible_allocation`（可行账单上界为 `C左 + C右`）；
+3. **候选映射**：对连续的 `u左`，候选读数 `r1 = (r0 + u左) mod M` 在计数环上构成一段连续弧：
+   - 弧不跨零点（`(r0+u_min) mod M <= (r0+u_max) mod M`）：单个闭区间；
+   - 弧跨零点：拆成 `[首端, M-1]` 与 `[0, 尾端]` 两个**互不重叠**的闭区间；
+   - 可行 `u左` 个数不少于 `M` 时残差覆盖全模数，直接返回全域 `[0, M-1]`，候选个数按去重后的残差计（`candidate_count = min(u_max-u_min+1, M)`）；
+   - `candidate_count = 1` 时 `unique = true`，候选读数被唯一确定，否则只给候选区间，**不猜测**。
+
+全程仅用 `floor`、整除与取模，速率容量由 `Fraction` 精确计算，无浮点误差；模数 `M = 1` 时唯一读数恒为 `0`，接口自然退化为全域单点。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、换表丢番图联立与跨日子段界（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界与漏采读数候选（Fraction 精确计算）
 tests/
   test_api.py
 Dockerfile
